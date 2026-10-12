@@ -32,7 +32,7 @@ import {
   getCurrentTime24, 
   formatTime24to12 
 } from './utils/simpleDates';
-import { parseNaturalLanguageInput, type ParsedItem } from './utils/nlpParser';
+import { processSmartInput, type ParsedItem } from './utils/nlpParser';
 import { scanScreenshot } from './utils/ocrScanner';
 
 export function App() {
@@ -93,6 +93,79 @@ export function App() {
     setQuickTime(getCurrentTime24());
     setQuickAmount('');
     setQuickNote('');
+  };
+
+  // Feedback / Notification banner
+  const [feedbackMessage, setFeedbackMessage] = useState<{
+    text: string;
+    type: 'success' | 'info' | 'delete';
+  } | null>(null);
+
+  // Auto-dismiss feedback message after 4.5s
+  useEffect(() => {
+    if (!feedbackMessage) return;
+    const timer = setTimeout(() => {
+      setFeedbackMessage(null);
+    }, 4500);
+    return () => clearTimeout(timer);
+  }, [feedbackMessage]);
+
+  // Edit Transaction Modal state
+  const [editingTransaction, setEditingTransaction] = useState<Transaction | null>(null);
+  const [editAmount, setEditAmount] = useState('');
+  const [editNote, setEditNote] = useState('');
+  const [editType, setEditType] = useState<'income' | 'expense'>('expense');
+  const [editDate, setEditDate] = useState('');
+  const [editTime, setEditTime] = useState('');
+
+  const handleOpenEditModal = (tx: Transaction) => {
+    setEditingTransaction(tx);
+    setEditAmount(String(tx.amount));
+    setEditNote(tx.note);
+    setEditType(tx.type);
+    setEditDate(tx.date);
+
+    let time24 = '12:00';
+    if (tx.time && tx.time.includes(':')) {
+      const isPM = /PM/i.test(tx.time);
+      const isAM = /AM/i.test(tx.time);
+      const match = tx.time.match(/([0-9]{1,2}):([0-9]{2})/);
+      if (match) {
+        let h = parseInt(match[1], 10);
+        const m = match[2];
+        if (isPM && h < 12) h += 12;
+        if (isAM && h === 12) h = 0;
+        time24 = `${String(h).padStart(2, '0')}:${m}`;
+      }
+    }
+    setEditTime(time24);
+  };
+
+  const handleSaveTransactionEdit = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!editingTransaction) return;
+    const amt = parseFloat(editAmount);
+    if (isNaN(amt) || amt <= 0) return;
+
+    const chosenDate = editDate.trim() || todayStr;
+    const formattedTime = formatTime24to12(editTime);
+    const dayName = getDayOfWeek(chosenDate);
+
+    const updatedTx: Transaction = {
+      ...editingTransaction,
+      type: editType,
+      amount: amt,
+      note: editNote.trim() || (editType === 'income' ? 'Income' : 'Expense'),
+      date: chosenDate,
+      time: formattedTime,
+      day: dayName,
+    };
+
+    setTransactions((prev) =>
+      prev.map((t) => (t.id === editingTransaction.id ? updatedTx : t))
+    );
+    setFeedbackMessage({ text: `Updated ${updatedTx.note} ($${amt})`, type: 'success' });
+    setEditingTransaction(null);
   };
 
   // Screenshot OCR Scan state
@@ -307,34 +380,63 @@ export function App() {
 
   const bestDayInMonth = Math.max(...monthDailySummaries.map((d) => d.profit), 0);
 
-  // Action: Add natural language entry
+  // Action: Smart AI text message handler (Add, Edit, Update, or Delete)
   const handleAddNaturalMessage = (e: React.FormEvent) => {
     e.preventDefault();
     if (!naturalText.trim()) return;
 
-    const parsed = parseNaturalLanguageInput(naturalText);
-    if (parsed.length === 0) {
-      alert("Could not detect amounts. Try: 'made 185 on delivery, spent 42 on gas and 14 on lunch'");
+    const result = processSmartInput(naturalText, transactions);
+
+    if (result.action === 'delete') {
+      setTransactions((prev) => prev.filter((t) => t.id !== result.targetId));
+      setFeedbackMessage({ text: result.message, type: 'delete' });
+      setNaturalText('');
       return;
     }
 
-    const now = new Date();
-    const formattedTime = getCurrentTime();
-    const dayName = getDayOfWeek(todayStr);
+    if (result.action === 'update') {
+      setTransactions((prev) =>
+        prev.map((t) => {
+          if (t.id === result.targetId) {
+            const updated = { ...t, ...result.updatedFields };
+            if (result.updatedFields.date) {
+              updated.day = getDayOfWeek(result.updatedFields.date);
+            }
+            return updated;
+          }
+          return t;
+        })
+      );
+      setFeedbackMessage({ text: result.message, type: 'success' });
+      setNaturalText('');
+      return;
+    }
 
-    const newEntries: Transaction[] = parsed.map((item, idx) => ({
-      id: `${Date.now()}-${idx}`,
-      type: item.type,
-      amount: item.amount,
-      note: item.note,
-      date: todayStr,
-      time: formattedTime,
-      day: dayName,
-      timestamp: now.toISOString(),
-    }));
+    if (result.action === 'add') {
+      if (result.items.length === 0) {
+        setFeedbackMessage({ text: result.message, type: 'info' });
+        return;
+      }
 
-    setTransactions([...newEntries, ...transactions]);
-    setNaturalText('');
+      const now = new Date();
+      const formattedTime = getCurrentTime();
+      const dayName = getDayOfWeek(todayStr);
+
+      const newEntries: Transaction[] = result.items.map((item, idx) => ({
+        id: `${Date.now()}-${idx}`,
+        type: item.type,
+        amount: item.amount,
+        note: item.note,
+        date: todayStr,
+        time: formattedTime,
+        day: dayName,
+        timestamp: now.toISOString(),
+      }));
+
+      setTransactions((prev) => [...newEntries, ...prev]);
+      setFeedbackMessage({ text: result.message, type: 'success' });
+      setNaturalText('');
+    }
   };
 
   // Action: Add simple income or expense
@@ -369,7 +471,16 @@ export function App() {
 
   // Action: Delete transaction
   const handleDeleteTransaction = (id: string) => {
-    setTransactions(transactions.filter((t) => t.id !== id));
+    const target = transactions.find((t) => t.id === id);
+    if (!target) return;
+    setTransactions((prev) => prev.filter((t) => t.id !== id));
+    setFeedbackMessage({
+      text: `Deleted: ${target.type === 'income' ? '+$' : '-$'}${target.amount} (${target.note})`,
+      type: 'delete',
+    });
+    if (editingTransaction?.id === id) {
+      setEditingTransaction(null);
+    }
   };
 
   // Action: Handle File Upload for Screenshot Scanning
@@ -649,7 +760,7 @@ export function App() {
                 <div className="relative">
                   <textarea
                     rows={3}
-                    placeholder="made 185 on delivery, spent 42 on gas and 14 on lunch"
+                    placeholder="Type naturally: 'i spent 30$', 'that 30 was for food', 'change 30 to 45', or 'delete that 30'"
                     value={naturalText}
                     onChange={(e) => setNaturalText(e.target.value)}
                     className={`w-full p-3.5 rounded-2xl text-xs sm:text-sm font-medium border resize-none focus:outline-none transition ${
@@ -665,9 +776,31 @@ export function App() {
                   disabled={!naturalText.trim()}
                   className="w-full py-3 rounded-2xl font-bold text-sm text-white bg-[#131c2e] dark:bg-[#1e293b] hover:bg-[#1f2d4a] transition shadow-md disabled:opacity-40 active:scale-98"
                 >
-                  Add to today
+                  Send to Assistant
                 </button>
               </form>
+
+              {/* Feedback toast / smart AI response */}
+              {feedbackMessage && (
+                <div
+                  className={`p-3 rounded-2xl text-xs font-bold flex items-center justify-between animate-in fade-in slide-in-from-top-1 duration-150 ${
+                    feedbackMessage.type === 'delete'
+                      ? 'bg-rose-500/10 border border-rose-500/25 text-rose-600 dark:text-rose-400'
+                      : feedbackMessage.type === 'success'
+                      ? 'bg-teal-500/10 border border-teal-500/25 text-teal-600 dark:text-teal-400'
+                      : 'bg-amber-500/10 border border-amber-500/25 text-amber-600 dark:text-amber-400'
+                  }`}
+                >
+                  <span className="flex-1">✨ {feedbackMessage.text}</span>
+                  <button
+                    type="button"
+                    onClick={() => setFeedbackMessage(null)}
+                    className="p-1 rounded-md opacity-60 hover:opacity-100 ml-2"
+                  >
+                    <X size={13} />
+                  </button>
+                </div>
+              )}
 
               <p className="text-[11px] text-slate-400 dark:text-slate-500 text-center">
                 Everything stays on this page. No bank login needed.
@@ -724,7 +857,10 @@ export function App() {
                         key={tx.id}
                         className="py-3 flex items-center justify-between first:pt-1 last:pb-1 group"
                       >
-                        <div className="flex items-center gap-3 min-w-0">
+                        <div
+                          onClick={() => handleOpenEditModal(tx)}
+                          className="flex items-center gap-3 min-w-0 flex-1 cursor-pointer select-none"
+                        >
                           {/* Round Square Icon */}
                           <div
                             className={`w-9 h-9 rounded-2xl flex items-center justify-center font-bold text-sm shrink-0 ${
@@ -752,9 +888,9 @@ export function App() {
                           </div>
                         </div>
 
-                        <div className="flex items-center gap-3 shrink-0 ml-2">
+                        <div className="flex items-center gap-1.5 shrink-0 ml-2">
                           <span
-                            className={`font-black text-sm sm:text-base ${
+                            className={`font-black text-sm sm:text-base mr-0.5 ${
                               isIncome
                                 ? 'text-[#0d9488] dark:text-[#2dd4bf]'
                                 : 'text-[#e11d48] dark:text-[#f43f5e]'
@@ -763,12 +899,22 @@ export function App() {
                             {isIncome ? `+$${tx.amount}` : `-$${tx.amount}`}
                           </span>
 
+                          {/* Edit button */}
+                          <button
+                            onClick={() => handleOpenEditModal(tx)}
+                            className="p-1.5 rounded-xl text-slate-400 hover:text-teal-600 dark:hover:text-teal-400 hover:bg-slate-100 dark:hover:bg-slate-800 transition active:scale-90"
+                            title="Edit"
+                          >
+                            <Edit2 size={13} />
+                          </button>
+
+                          {/* Delete button */}
                           <button
                             onClick={() => handleDeleteTransaction(tx.id)}
-                            className="text-slate-300 dark:text-slate-600 hover:text-rose-500 dark:hover:text-rose-400 p-1 rounded transition opacity-0 group-hover:opacity-100"
+                            className="p-1.5 rounded-xl text-slate-400 hover:text-rose-500 dark:hover:text-rose-400 hover:bg-rose-50 dark:hover:bg-rose-950/30 transition active:scale-90"
                             title="Delete"
                           >
-                            <Trash2 size={14} />
+                            <Trash2 size={13} />
                           </button>
                         </div>
                       </div>
@@ -1294,6 +1440,165 @@ export function App() {
           </div>
         )}
       </div>
+
+      {/* ============================================================ */}
+      {/* EDIT TRANSACTION MODAL */}
+      {/* ============================================================ */}
+      {editingTransaction && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/70 backdrop-blur-sm animate-in fade-in duration-150">
+          <div
+            className={`w-full max-w-sm rounded-[28px] p-6 border shadow-2xl space-y-4 max-h-[92vh] overflow-y-auto ${
+              isDarkMode ? 'bg-[#141d2e] border-slate-800 text-slate-100' : 'bg-white border-slate-200 text-slate-900'
+            }`}
+          >
+            <div className="flex items-center justify-between">
+              <h3 className="font-extrabold text-lg flex items-center gap-2">
+                <Edit2 size={18} className="text-[#0d9488]" />
+                <span>Edit Transaction</span>
+              </h3>
+              <button
+                onClick={() => setEditingTransaction(null)}
+                className="p-1.5 rounded-xl hover:bg-slate-100 dark:hover:bg-slate-800 text-slate-400"
+              >
+                <X size={18} />
+              </button>
+            </div>
+
+            <form onSubmit={handleSaveTransactionEdit} className="space-y-3.5">
+              {/* Type Switcher */}
+              <div className="grid grid-cols-2 gap-2 p-1 rounded-2xl bg-slate-100 dark:bg-slate-900 border border-slate-200 dark:border-slate-800">
+                <button
+                  type="button"
+                  onClick={() => setEditType('income')}
+                  className={`py-2 rounded-xl text-xs font-bold transition flex items-center justify-center gap-1.5 ${
+                    editType === 'income'
+                      ? 'bg-[#0d9488] text-white shadow-sm'
+                      : 'text-slate-500 hover:text-slate-900 dark:hover:text-slate-100'
+                  }`}
+                >
+                  <Plus size={14} className="stroke-[3]" />
+                  <span>Income</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setEditType('expense')}
+                  className={`py-2 rounded-xl text-xs font-bold transition flex items-center justify-center gap-1.5 ${
+                    editType === 'expense'
+                      ? 'bg-[#e11d48] text-white shadow-sm'
+                      : 'text-slate-500 hover:text-slate-900 dark:hover:text-slate-100'
+                  }`}
+                >
+                  <Minus size={14} className="stroke-[3]" />
+                  <span>Expense</span>
+                </button>
+              </div>
+
+              <div>
+                <label className="text-xs font-bold text-slate-500 uppercase tracking-wider block mb-1">
+                  Amount ($)
+                </label>
+                <input
+                  type="number"
+                  step="0.01"
+                  min="0.01"
+                  required
+                  value={editAmount}
+                  onChange={(e) => setEditAmount(e.target.value)}
+                  className={`w-full px-4 py-2.5 rounded-2xl text-3xl font-black border focus:outline-none ${
+                    isDarkMode
+                      ? 'bg-[#0b0f19] border-slate-800 text-slate-100'
+                      : 'bg-slate-50 border-slate-200 text-slate-900'
+                  }`}
+                />
+              </div>
+
+              <div>
+                <label className="text-xs font-bold text-slate-500 uppercase tracking-wider block mb-1">
+                  What was it for?
+                </label>
+                <input
+                  type="text"
+                  required
+                  value={editNote}
+                  onChange={(e) => setEditNote(e.target.value)}
+                  className={`w-full px-3.5 py-2 rounded-xl text-sm font-medium border focus:outline-none ${
+                    isDarkMode
+                      ? 'bg-[#0b0f19] border-slate-800 text-slate-100'
+                      : 'bg-slate-50 border-slate-200 text-slate-900'
+                  }`}
+                />
+              </div>
+
+              {/* Date & Time fields */}
+              <div className="space-y-2 pt-1 border-t border-slate-100 dark:border-slate-800">
+                <div className="grid grid-cols-2 gap-2">
+                  <div>
+                    <label className="text-[10px] font-bold text-slate-400 uppercase tracking-wider block mb-1 flex items-center gap-1">
+                      <Calendar size={11} className="text-[#0d9488]" />
+                      <span>Date</span>
+                    </label>
+                    <input
+                      type="date"
+                      required
+                      value={editDate}
+                      onChange={(e) => setEditDate(e.target.value)}
+                      className={`w-full px-3 py-2 rounded-xl text-xs font-bold border focus:outline-none ${
+                        isDarkMode
+                          ? 'bg-[#0b0f19] border-slate-800 text-slate-100'
+                          : 'bg-slate-50 border-slate-200 text-slate-900'
+                      }`}
+                    />
+                  </div>
+
+                  <div>
+                    <label className="text-[10px] font-bold text-slate-400 uppercase tracking-wider block mb-1 flex items-center gap-1">
+                      <Clock size={11} className="text-[#0d9488]" />
+                      <span>Time</span>
+                    </label>
+                    <input
+                      type="time"
+                      required
+                      value={editTime}
+                      onChange={(e) => setEditTime(e.target.value)}
+                      className={`w-full px-3 py-2 rounded-xl text-xs font-bold border focus:outline-none ${
+                        isDarkMode
+                          ? 'bg-[#0b0f19] border-slate-800 text-slate-100'
+                          : 'bg-slate-50 border-slate-200 text-slate-900'
+                      }`}
+                    />
+                  </div>
+                </div>
+
+                {/* Day of week pill */}
+                <div className="p-2.5 rounded-xl bg-slate-50 dark:bg-slate-900/80 border border-slate-200 dark:border-slate-800 text-[11px] flex items-center justify-between text-slate-600 dark:text-slate-300 font-semibold">
+                  <span>🗓️ Day: <strong className="text-teal-600 dark:text-teal-400">{getDayOfWeek(editDate)}</strong></span>
+                  <span>🕒 {formatTime24to12(editTime)}</span>
+                </div>
+              </div>
+
+              {/* Save & Delete Buttons */}
+              <div className="space-y-2 pt-2">
+                <button
+                  type="submit"
+                  disabled={!editAmount || parseFloat(editAmount) <= 0}
+                  className="w-full py-3 rounded-2xl font-bold text-sm text-white bg-[#0d9488] hover:bg-[#0f766e] transition shadow-md disabled:opacity-40 active:scale-98"
+                >
+                  Save Changes
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => handleDeleteTransaction(editingTransaction.id)}
+                  className="w-full py-2.5 rounded-2xl font-bold text-xs text-rose-600 dark:text-rose-400 hover:bg-rose-50 dark:hover:bg-rose-950/30 transition flex items-center justify-center gap-1.5"
+                >
+                  <Trash2 size={14} />
+                  <span>Delete this transaction</span>
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
 
       {/* ============================================================ */}
       {/* QUICK ADD MODAL (+ Add income or - Add expense) */}
