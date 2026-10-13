@@ -4,6 +4,7 @@ export interface ParsedItem {
   type: 'income' | 'expense';
   amount: number;
   note: string;
+  date?: string; // YYYY-MM-DD
 }
 
 export type SmartParseAction =
@@ -24,13 +25,66 @@ export type SmartParseAction =
       action: 'add';
       items: ParsedItem[];
       message: string;
+      targetDate?: string;
+      dateLabel?: string;
     };
 
 /**
+ * Detects past dates from phrases like "yesterday", "last night", "2 days ago", "last friday", "on monday"
+ */
+export function detectDateFromText(text: string): { targetDate: string; dateLabel: string; cleanedText: string } | null {
+  const now = new Date();
+  const format = (d: Date) => {
+    const y = d.getFullYear();
+    const m = String(d.getMonth() + 1).padStart(2, '0');
+    const day = String(d.getDate()).padStart(2, '0');
+    return `${y}-${m}-${day}`;
+  };
+
+  // Check "yesterday" or "last night"
+  if (/\b(yesterday|last\s+night)\b/i.test(text)) {
+    const d = new Date(now);
+    d.setDate(d.getDate() - 1);
+    const cleaned = text.replace(/\b(yesterday|last\s+night)\b/gi, '').trim();
+    return { targetDate: format(d), dateLabel: 'Yesterday', cleanedText: cleaned };
+  }
+
+  // Check "N days ago"
+  const daysAgoMatch = text.match(/\b([0-9]+)\s+days?\s+ago\b/i);
+  if (daysAgoMatch) {
+    const days = parseInt(daysAgoMatch[1], 10);
+    const d = new Date(now);
+    d.setDate(d.getDate() - days);
+    const cleaned = text.replace(/\b[0-9]+\s+days?\s+ago\b/gi, '').trim();
+    return { targetDate: format(d), dateLabel: `${days} days ago`, cleanedText: cleaned };
+  }
+
+  // Check day of week e.g. "last friday", "on friday", "friday"
+  const dayNames = ['sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday'];
+  const dayMatch = text.match(/\b(?:last\s+|on\s+)?(sunday|monday|tuesday|wednesday|thursday|friday|saturday)\b/i);
+  if (dayMatch) {
+    const targetDayIndex = dayNames.indexOf(dayMatch[1].toLowerCase());
+    if (targetDayIndex !== -1) {
+      const currentDayIndex = now.getDay();
+      let diff = currentDayIndex - targetDayIndex;
+      if (diff <= 0) diff += 7; // Go back to most recent past occurrence of that day
+      const d = new Date(now);
+      d.setDate(d.getDate() - diff);
+      const cleaned = text.replace(new RegExp(`\\b(?:last\\s+|on\\s+)?${dayMatch[1]}\\b`, 'gi'), '').trim();
+      const capDay = dayMatch[1].charAt(0).toUpperCase() + dayMatch[1].slice(1).toLowerCase();
+      return { targetDate: format(d), dateLabel: capDay, cleanedText: cleaned };
+    }
+  }
+
+  return null;
+}
+
+/**
  * Intelligent financial text processor that understands:
- * 1. Adding: "i spent 30$", "made 185 on delivery, spent 42 on gas"
- * 2. Updating: "i spent that 30$ on food", "that 30 was for food", "change that 30 to 40", "that was for lunch"
- * 3. Deleting: "delete that 30$", "remove that 30", "delete last", "undo", "remove gas"
+ * 1. Adding with dates: "yesterday spent 45 on dinner", "2 days ago made 180 on delivery"
+ * 2. Adding normal: "i spent 30$", "made 185 on delivery, spent 42 on gas"
+ * 3. Updating: "i spent that 30$ on food", "that 30 was for food", "change that 30 to 40", "that was for lunch"
+ * 4. Deleting: "delete that 30$", "remove that 30", "delete last", "undo", "remove gas"
  */
 export function processSmartInput(
   rawText: string,
@@ -137,7 +191,6 @@ export function processSmartInput(
   }
 
   // 2B. "i spent that 30$ on food", "that 30$ was on food", "that 30 was for lunch", "the 30 was food"
-  // Patterns like: (that|the) <amount> (was on|was for|on|for|was) <note>
   const updateNoteWithAmountMatch = text.match(
     /(?:(?:i\s+)?(?:spent|made|paid|put)\s+that|that|the)\s+\$?([0-9]+(?:\.[0-9]{1,2})?)\$?\s+(?:was\s+)?(?:on|for|at|towards)?\s+(.+)/i
   );
@@ -158,7 +211,6 @@ export function processSmartInput(
         message: `Updated note on $${targetAmount} to '${newNote}'`,
       };
     } else {
-      // If no existing transaction was found with that amount, create it cleanly!
       return {
         action: 'add',
         items: [
@@ -206,24 +258,37 @@ export function processSmartInput(
   }
 
   // ============================================================
-  // 3. ADD NEW TRANSACTIONS
+  // 3. ADD NEW TRANSACTIONS (WITH NATURAL DATE DETECTION)
   // ============================================================
-  const addedItems = parseNaturalLanguageInput(text);
+  const dateInfo = detectDateFromText(text);
+  const textToParse = dateInfo ? dateInfo.cleanedText : text;
+  const addedItems = parseNaturalLanguageInput(textToParse);
+
   if (addedItems.length > 0) {
+    if (dateInfo) {
+      addedItems.forEach((item) => {
+        item.date = dateInfo.targetDate;
+      });
+    }
+
     const summary = addedItems
       .map((it) => `${it.type === 'income' ? '+$' : '-$'}${it.amount} (${it.note})`)
       .join(', ');
+
+    const datePrefix = dateInfo ? `[${dateInfo.dateLabel}] ` : '';
     return {
       action: 'add',
       items: addedItems,
-      message: `Added: ${summary}`,
+      message: `Added ${datePrefix}${summary}`,
+      targetDate: dateInfo?.targetDate,
+      dateLabel: dateInfo?.dateLabel,
     };
   }
 
   return {
     action: 'add',
     items: [],
-    message: "Could not understand. Try: 'spent 30 on food', 'that 30 was for lunch', or 'delete that 30'",
+    message: "Could not understand. Try: 'spent 30 on food', 'yesterday made 150', or 'delete that 30'",
   };
 }
 

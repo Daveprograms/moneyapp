@@ -21,7 +21,12 @@ import {
   FileSpreadsheet,
   Clock,
   ChevronDown,
-  ChevronUp
+  ChevronUp,
+  Mic,
+  MicOff,
+  Lock,
+  Unlock,
+  Award
 } from 'lucide-react';
 import type { Transaction, Goal } from './types/finance';
 import { 
@@ -34,6 +39,7 @@ import {
 } from './utils/simpleDates';
 import { processSmartInput, type ParsedItem } from './utils/nlpParser';
 import { scanScreenshot } from './utils/ocrScanner';
+import { computeCategoryBreakdown, COMMON_EXPENSE_TAGS, COMMON_INCOME_TAGS } from './utils/categoryDetector';
 
 export function App() {
   const todayStr = getToday();
@@ -166,6 +172,152 @@ export function App() {
     );
     setFeedbackMessage({ text: `Updated ${updatedTx.note} ($${amt})`, type: 'success' });
     setEditingTransaction(null);
+  };
+
+  // Daily Target state (default $150 or saved)
+  const [dailyTarget, setDailyTarget] = useState<number>(() => {
+    try {
+      const saved = localStorage.getItem('daily_profit_target_v1');
+      return saved ? parseFloat(saved) : 150;
+    } catch {
+      return 150;
+    }
+  });
+  const [isEditingDailyTarget, setIsEditingDailyTarget] = useState(false);
+  const [dailyTargetInput, setDailyTargetInput] = useState(String(dailyTarget));
+
+  useEffect(() => {
+    localStorage.setItem('daily_profit_target_v1', String(dailyTarget));
+  }, [dailyTarget]);
+
+  const handleSaveDailyTarget = (e: React.FormEvent) => {
+    e.preventDefault();
+    const val = parseFloat(dailyTargetInput);
+    if (isNaN(val) || val <= 0) return;
+    setDailyTarget(val);
+    setIsEditingDailyTarget(false);
+    setFeedbackMessage({ text: `Daily target set to $${val}`, type: 'success' });
+  };
+
+  // Voice Input state
+  const [isListening, setIsListening] = useState(false);
+  const recognitionRef = useRef<any>(null);
+
+  const handleToggleVoice = () => {
+    const SpeechRec = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+    if (!SpeechRec) {
+      setFeedbackMessage({
+        text: "Voice recognition not supported on this browser. You can use your phone keyboard's mic key!",
+        type: 'info',
+      });
+      return;
+    }
+
+    if (isListening) {
+      try {
+        recognitionRef.current?.stop();
+      } catch {}
+      setIsListening(false);
+      return;
+    }
+
+    try {
+      const recognition = new SpeechRec();
+      recognition.continuous = false;
+      recognition.interimResults = false;
+      recognition.lang = 'en-US';
+
+      recognition.onstart = () => {
+        setIsListening(true);
+      };
+
+      recognition.onresult = (event: any) => {
+        const transcript = event.results[0][0].transcript;
+        setNaturalText((prev) => (prev ? `${prev} ${transcript}` : transcript));
+        setIsListening(false);
+      };
+
+      recognition.onerror = () => {
+        setIsListening(false);
+      };
+
+      recognition.onend = () => {
+        setIsListening(false);
+      };
+
+      recognitionRef.current = recognition;
+      recognition.start();
+    } catch {
+      setIsListening(false);
+    }
+  };
+
+  // Passcode / Privacy Lock state
+  const [passcode, setPasscode] = useState<string | null>(() => {
+    try {
+      return localStorage.getItem('app_passcode_v1');
+    } catch {
+      return null;
+    }
+  });
+  const [isLocked, setIsLocked] = useState<boolean>(() => {
+    try {
+      return !!localStorage.getItem('app_passcode_v1');
+    } catch {
+      return false;
+    }
+  });
+  const [enteredPin, setEnteredPin] = useState<string>('');
+  const [pinError, setPinError] = useState(false);
+  const [isSettingPinModalOpen, setIsSettingPinModalOpen] = useState(false);
+  const [newPinInput, setNewPinInput] = useState('');
+
+  const handlePinDigit = (digit: string) => {
+    if (enteredPin.length >= 4) return;
+    const nextPin = enteredPin + digit;
+    setEnteredPin(nextPin);
+
+    if (nextPin.length === 4) {
+      if (nextPin === passcode) {
+        setIsLocked(false);
+        setEnteredPin('');
+        setPinError(false);
+      } else {
+        setPinError(true);
+        setTimeout(() => {
+          setEnteredPin('');
+          setPinError(false);
+        }, 700);
+      }
+    }
+  };
+
+  const handlePinBackspace = () => {
+    setEnteredPin((prev) => prev.slice(0, -1));
+  };
+
+  const handleSaveNewPin = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (newPinInput.length !== 4 || !/^\d{4}$/.test(newPinInput)) {
+      alert('Please enter a 4-digit PIN');
+      return;
+    }
+    localStorage.setItem('app_passcode_v1', newPinInput);
+    setPasscode(newPinInput);
+    setIsSettingPinModalOpen(false);
+    setNewPinInput('');
+    setFeedbackMessage({ text: '4-digit Passcode lock enabled!', type: 'success' });
+  };
+
+  const handleRemovePin = () => {
+    if (window.confirm('Remove passcode lock? Anyone opening the app will be able to view your data.')) {
+      localStorage.removeItem('app_passcode_v1');
+      setPasscode(null);
+      setIsLocked(false);
+      setIsSettingPinModalOpen(false);
+      setNewPinInput('');
+      setFeedbackMessage({ text: 'Passcode lock removed.', type: 'info' });
+    }
   };
 
   // Screenshot OCR Scan state
@@ -380,6 +532,10 @@ export function App() {
 
   const bestDayInMonth = Math.max(...monthDailySummaries.map((d) => d.profit), 0);
 
+  // Category breakdowns for Week and Month
+  const weekCategoryBreakdown = computeCategoryBreakdown(weekTransactions);
+  const monthCategoryBreakdown = computeCategoryBreakdown(monthTransactions);
+
   // Action: Smart AI text message handler (Add, Edit, Update, or Delete)
   const handleAddNaturalMessage = (e: React.FormEvent) => {
     e.preventDefault();
@@ -420,18 +576,20 @@ export function App() {
 
       const now = new Date();
       const formattedTime = getCurrentTime();
-      const dayName = getDayOfWeek(todayStr);
 
-      const newEntries: Transaction[] = result.items.map((item, idx) => ({
-        id: `${Date.now()}-${idx}`,
-        type: item.type,
-        amount: item.amount,
-        note: item.note,
-        date: todayStr,
-        time: formattedTime,
-        day: dayName,
-        timestamp: now.toISOString(),
-      }));
+      const newEntries: Transaction[] = result.items.map((item, idx) => {
+        const itemDate = item.date || result.targetDate || todayStr;
+        return {
+          id: `${Date.now()}-${idx}`,
+          type: item.type,
+          amount: item.amount,
+          note: item.note,
+          date: itemDate,
+          time: formattedTime,
+          day: getDayOfWeek(itemDate),
+          timestamp: now.toISOString(),
+        };
+      });
 
       setTransactions((prev) => [...newEntries, ...prev]);
       setFeedbackMessage({ text: result.message, type: 'success' });
@@ -581,6 +739,87 @@ export function App() {
   const greenBarPercent = totalVolume > 0 ? Math.round((todayMade / totalVolume) * 100) : 100;
   const redBarPercent = 100 - greenBarPercent;
 
+  // Passcode Lock Screen guard
+  if (isLocked && passcode) {
+    return (
+      <div className={`min-h-screen ${isDarkMode ? 'bg-[#0b0f19] text-slate-100' : 'bg-[#f0f4f8] text-[#1e293b]'} flex flex-col items-center justify-center p-6 select-none font-sans`}>
+        <div className="w-full max-w-xs flex flex-col items-center space-y-8 animate-in fade-in duration-200">
+          <div className="flex flex-col items-center space-y-2">
+            <div className={`w-16 h-16 rounded-3xl flex items-center justify-center shadow-md ${
+              isDarkMode ? 'bg-[#141d2e] text-teal-400 border border-slate-800' : 'bg-white text-teal-600 border border-slate-200'
+            }`}>
+              <Lock size={32} />
+            </div>
+            <h2 className="text-xl font-black tracking-tight mt-2">Enter Passcode</h2>
+            <p className="text-xs text-slate-400">Unlock your personal finance tracker</p>
+          </div>
+
+          {/* 4 PIN Dots */}
+          <div className={`flex items-center gap-4 ${pinError ? 'animate-bounce text-rose-500' : ''}`}>
+            {[0, 1, 2, 3].map((i) => {
+              const isFilled = enteredPin.length > i;
+              return (
+                <div
+                  key={i}
+                  className={`w-4 h-4 rounded-full border-2 transition-all duration-200 ${
+                    pinError
+                      ? 'border-rose-500 bg-rose-500'
+                      : isFilled
+                      ? 'bg-teal-500 border-teal-500 scale-110'
+                      : isDarkMode
+                      ? 'border-slate-700 bg-transparent'
+                      : 'border-slate-300 bg-transparent'
+                  }`}
+                />
+              );
+            })}
+          </div>
+
+          {/* iOS-Style Number Keypad */}
+          <div className="grid grid-cols-3 gap-4 w-full">
+            {['1', '2', '3', '4', '5', '6', '7', '8', '9'].map((digit) => (
+              <button
+                key={digit}
+                type="button"
+                onClick={() => handlePinDigit(digit)}
+                className={`w-16 h-16 mx-auto rounded-full text-2xl font-bold flex items-center justify-center shadow-sm active:scale-95 transition ${
+                  isDarkMode
+                    ? 'bg-[#141d2e] text-white hover:bg-[#1a253a] active:bg-[#202e47] border border-slate-800'
+                    : 'bg-white text-slate-800 hover:bg-slate-50 active:bg-slate-100 border border-slate-200'
+                }`}
+              >
+                {digit}
+              </button>
+            ))}
+            <div />
+            <button
+              type="button"
+              onClick={() => handlePinDigit('0')}
+              className={`w-16 h-16 mx-auto rounded-full text-2xl font-bold flex items-center justify-center shadow-sm active:scale-95 transition ${
+                isDarkMode
+                  ? 'bg-[#141d2e] text-white hover:bg-[#1a253a] active:bg-[#202e47] border border-slate-800'
+                  : 'bg-white text-slate-800 hover:bg-slate-50 active:bg-slate-100 border border-slate-200'
+              }`}
+            >
+              0
+            </button>
+            <button
+              type="button"
+              onClick={handlePinBackspace}
+              className={`w-16 h-16 mx-auto rounded-full text-xs font-bold flex items-center justify-center shadow-sm active:scale-95 transition ${
+                isDarkMode
+                  ? 'bg-transparent text-slate-400 hover:text-white'
+                  : 'bg-transparent text-slate-500 hover:text-slate-900'
+              }`}
+            >
+              Delete
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className={`min-h-screen ${isDarkMode ? 'bg-[#0b0f19] text-slate-100' : 'bg-[#f0f4f8] text-[#1e293b]'} font-sans pb-28 antialiased selection:bg-teal-500/20`}>
       {/* Hidden file input for screenshot scan */}
@@ -637,6 +876,26 @@ export function App() {
             >
               <Database size={14} />
               <span>Save & Backup</span>
+            </button>
+
+            {/* Lock / PIN Button */}
+            <button
+              onClick={() => {
+                if (passcode) {
+                  setIsLocked(true);
+                } else {
+                  setIsSettingPinModalOpen(true);
+                }
+              }}
+              className={`flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-bold border transition shadow-sm ${
+                isDarkMode
+                  ? 'bg-slate-800 text-teal-300 border-slate-700 hover:bg-slate-700'
+                  : 'bg-white text-teal-700 border-slate-200 hover:bg-slate-50'
+              }`}
+              title={passcode ? 'Lock app now' : 'Set up 4-Digit Passcode'}
+            >
+              {passcode ? <Lock size={14} /> : <Unlock size={14} />}
+              <span>{passcode ? 'Lock' : 'PIN'}</span>
             </button>
 
             {/* Bright Mode / Dark Mode Toggle */}
@@ -707,6 +966,72 @@ export function App() {
                   </span>
                 </div>
               </div>
+
+              {/* Daily Profit Target & Milestone */}
+              <div className="mt-4 pt-4 border-t border-slate-100 dark:border-slate-800/80">
+                <div className="flex items-center justify-between text-xs mb-1.5">
+                  <div className="flex items-center gap-1.5">
+                    <Target size={13} className="text-teal-600 dark:text-teal-400" />
+                    <span className="font-bold text-slate-600 dark:text-slate-300">Daily Target:</span>
+                    {!isEditingDailyTarget ? (
+                      <button
+                        onClick={() => {
+                          setDailyTargetInput(String(dailyTarget));
+                          setIsEditingDailyTarget(true);
+                        }}
+                        className="font-extrabold text-teal-600 dark:text-teal-400 hover:underline flex items-center gap-1"
+                        title="Edit daily profit target"
+                      >
+                        ${dailyTarget}
+                        <Edit2 size={11} className="opacity-60" />
+                      </button>
+                    ) : (
+                      <form onSubmit={handleSaveDailyTarget} className="flex items-center gap-1">
+                        <span className="text-slate-400 font-bold">$</span>
+                        <input
+                          type="number"
+                          step="1"
+                          autoFocus
+                          value={dailyTargetInput}
+                          onChange={(e) => setDailyTargetInput(e.target.value)}
+                          className="w-16 px-1.5 py-0.5 rounded-md text-xs font-bold border border-teal-500 bg-white dark:bg-slate-800 focus:outline-none"
+                        />
+                        <button type="submit" className="p-0.5 text-teal-600 font-bold hover:bg-teal-50 dark:hover:bg-slate-700 rounded">
+                          <Check size={13} />
+                        </button>
+                        <button type="button" onClick={() => setIsEditingDailyTarget(false)} className="p-0.5 text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-700 rounded">
+                          <X size={13} />
+                        </button>
+                      </form>
+                    )}
+                  </div>
+                  <span className="font-bold text-slate-400">
+                    {Math.max(0, Math.round((todayProfit / (dailyTarget || 1)) * 100))}%
+                  </span>
+                </div>
+
+                {/* Progress bar towards daily target */}
+                <div className="w-full h-2 rounded-full bg-slate-100 dark:bg-slate-800 overflow-hidden">
+                  <div
+                    className={`h-full transition-all duration-500 ${
+                      todayProfit >= dailyTarget && dailyTarget > 0
+                        ? 'bg-gradient-to-r from-teal-400 to-emerald-500'
+                        : 'bg-teal-500'
+                    }`}
+                    style={{
+                      width: `${Math.min(100, Math.max(0, Math.round((todayProfit / (dailyTarget || 1)) * 100)))}%`
+                    }}
+                  />
+                </div>
+
+                {/* Celebration badge if target reached */}
+                {todayProfit >= dailyTarget && dailyTarget > 0 && (
+                  <div className="mt-2.5 py-1.5 px-3 rounded-xl bg-emerald-500/10 border border-emerald-500/20 text-emerald-600 dark:text-emerald-400 text-xs font-bold flex items-center justify-center gap-1.5 animate-in fade-in">
+                    <Award size={14} className="text-emerald-500" />
+                    <span>Target Hit! You beat today's ${dailyTarget} profit goal!</span>
+                  </div>
+                )}
+              </div>
             </div>
 
             {/* Action Buttons: Add Income, Add Expense, Scan Screenshot */}
@@ -747,13 +1072,62 @@ export function App() {
             <div className={`p-6 rounded-[28px] border shadow-sm space-y-3 ${
               isDarkMode ? 'bg-[#141d2e] border-slate-800/80' : 'bg-white border-slate-200/60'
             }`}>
-              <div>
-                <h3 className="font-extrabold text-base leading-snug">
-                  Just tell me what happened
-                </h3>
-                <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
-                  Type it like a text message. I'll sort it into income and expenses.
-                </p>
+              <div className="flex items-start justify-between">
+                <div>
+                  <h3 className="font-extrabold text-base leading-snug">
+                    Just tell me what happened
+                  </h3>
+                  <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
+                    Type it like a text message. I'll sort it into income and expenses.
+                  </p>
+                </div>
+
+                {/* Voice / Mic Button */}
+                <button
+                  type="button"
+                  onClick={handleToggleVoice}
+                  className={`flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-bold transition shadow-sm shrink-0 ml-2 ${
+                    isListening
+                      ? 'bg-rose-500 text-white animate-pulse'
+                      : isDarkMode
+                      ? 'bg-slate-800 text-teal-300 hover:bg-slate-700 border border-slate-700'
+                      : 'bg-teal-50 text-teal-700 hover:bg-teal-100 border border-teal-200/60'
+                  }`}
+                  title="Speak your entry with voice"
+                >
+                  {isListening ? <MicOff size={13} /> : <Mic size={13} />}
+                  <span>{isListening ? 'Listening...' : 'Voice'}</span>
+                </button>
+              </div>
+
+              {/* Quick Suggestion Pills */}
+              <div className="space-y-1">
+                <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider block">
+                  Quick tags:
+                </span>
+                <div className="flex flex-wrap gap-1.5">
+                  {[
+                    { label: '🍔 Food $15', text: 'spent 15 on food' },
+                    { label: '⛽ Gas $35', text: 'spent 35 on gas' },
+                    { label: '🚗 Shift +$120', text: 'made 120 on delivery shift' },
+                    { label: '🛒 Groceries $50', text: 'spent 50 on groceries' },
+                    { label: '☕ Coffee $6', text: 'spent 6 on coffee' },
+                    { label: 'Yesterday -25', text: 'yesterday spent 25 on dinner' },
+                  ].map((pill, i) => (
+                    <button
+                      key={i}
+                      type="button"
+                      onClick={() => setNaturalText(pill.text)}
+                      className={`px-2.5 py-1 rounded-xl text-[11px] font-bold border transition active:scale-95 ${
+                        isDarkMode
+                          ? 'bg-slate-900 hover:bg-slate-800 border-slate-800 text-slate-300'
+                          : 'bg-slate-100 hover:bg-slate-200/70 border-slate-200 text-slate-700'
+                      }`}
+                    >
+                      {pill.label}
+                    </button>
+                  ))}
+                </div>
               </div>
 
               <form onSubmit={handleAddNaturalMessage} className="space-y-3">
@@ -1113,6 +1487,48 @@ export function App() {
                 })}
               </div>
             </div>
+
+            {/* Top Spending Categories Breakdown */}
+            <div className={`p-6 rounded-[28px] border shadow-sm space-y-3.5 ${
+              isDarkMode ? 'bg-[#141d2e] border-slate-800/80' : 'bg-white border-slate-200/60'
+            }`}>
+              <div className="flex items-center justify-between">
+                <h3 className="font-extrabold text-base">Top Spending</h3>
+                <span className="text-xs font-bold text-rose-500">
+                  Total: ${weekSpent.toLocaleString()}
+                </span>
+              </div>
+
+              {weekCategoryBreakdown.length === 0 ? (
+                <p className="text-xs text-slate-400 py-3 text-center">
+                  No expenses logged this week yet.
+                </p>
+              ) : (
+                <div className="space-y-3 pt-1">
+                  {weekCategoryBreakdown.slice(0, 5).map((cat) => (
+                    <div key={cat.name} className="space-y-1">
+                      <div className="flex items-center justify-between text-xs font-bold">
+                        <span className="flex items-center gap-1.5 text-slate-700 dark:text-slate-200">
+                          <span>{cat.icon}</span>
+                          <span>{cat.name}</span>
+                          <span className="text-[10px] text-slate-400 font-normal">({cat.count})</span>
+                        </span>
+                        <div className="flex items-center gap-2">
+                          <span className="text-slate-400 text-[11px] font-semibold">{cat.percentage}%</span>
+                          <span className="text-rose-600 dark:text-rose-400">${cat.amount.toLocaleString()}</span>
+                        </div>
+                      </div>
+                      <div className="w-full h-2 rounded-full bg-slate-100 dark:bg-slate-800 overflow-hidden">
+                        <div
+                          className="h-full bg-rose-500 rounded-full transition-all duration-300"
+                          style={{ width: `${cat.percentage}%` }}
+                        />
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
           </div>
         )}
 
@@ -1299,6 +1715,48 @@ export function App() {
                   );
                 })}
               </div>
+            </div>
+
+            {/* Top Spending Categories Breakdown */}
+            <div className={`p-6 rounded-[28px] border shadow-sm space-y-3.5 ${
+              isDarkMode ? 'bg-[#141d2e] border-slate-800/80' : 'bg-white border-slate-200/60'
+            }`}>
+              <div className="flex items-center justify-between">
+                <h3 className="font-extrabold text-base">Top Spending (Past 30 Days)</h3>
+                <span className="text-xs font-bold text-rose-500">
+                  Total: ${monthSpent.toLocaleString()}
+                </span>
+              </div>
+
+              {monthCategoryBreakdown.length === 0 ? (
+                <p className="text-xs text-slate-400 py-3 text-center">
+                  No expenses logged this month yet.
+                </p>
+              ) : (
+                <div className="space-y-3 pt-1">
+                  {monthCategoryBreakdown.slice(0, 5).map((cat) => (
+                    <div key={cat.name} className="space-y-1">
+                      <div className="flex items-center justify-between text-xs font-bold">
+                        <span className="flex items-center gap-1.5 text-slate-700 dark:text-slate-200">
+                          <span>{cat.icon}</span>
+                          <span>{cat.name}</span>
+                          <span className="text-[10px] text-slate-400 font-normal">({cat.count})</span>
+                        </span>
+                        <div className="flex items-center gap-2">
+                          <span className="text-slate-400 text-[11px] font-semibold">{cat.percentage}%</span>
+                          <span className="text-rose-600 dark:text-rose-400">${cat.amount.toLocaleString()}</span>
+                        </div>
+                      </div>
+                      <div className="w-full h-2 rounded-full bg-slate-100 dark:bg-slate-800 overflow-hidden">
+                        <div
+                          className="h-full bg-rose-500 rounded-full transition-all duration-300"
+                          style={{ width: `${cat.percentage}%` }}
+                        />
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
             </div>
           </div>
         )}
@@ -1660,6 +2118,32 @@ export function App() {
                       : 'bg-slate-50 border-slate-200 text-slate-900'
                   }`}
                 />
+              </div>
+
+              {/* Quick Category Tags */}
+              <div className="space-y-1">
+                <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider block">
+                  Quick tags:
+                </span>
+                <div className="flex flex-wrap gap-1.5 max-h-24 overflow-y-auto">
+                  {(quickAddType === 'income' ? COMMON_INCOME_TAGS : COMMON_EXPENSE_TAGS).map((tag) => (
+                    <button
+                      key={tag.label}
+                      type="button"
+                      onClick={() => setQuickNote(tag.label)}
+                      className={`px-2.5 py-1 rounded-xl text-xs font-semibold border transition active:scale-95 flex items-center gap-1 ${
+                        quickNote === tag.label
+                          ? 'bg-teal-500 text-white border-teal-500 shadow-xs'
+                          : isDarkMode
+                          ? 'bg-slate-900 border-slate-700 text-slate-300 hover:bg-slate-800'
+                          : 'bg-slate-100 border-slate-200 text-slate-700 hover:bg-slate-200'
+                      }`}
+                    >
+                      <span>{tag.icon}</span>
+                      <span>{tag.label}</span>
+                    </button>
+                  ))}
+                </div>
               </div>
 
               {/* Exact Date & Time Tracking */}
@@ -2032,6 +2516,66 @@ export function App() {
               </button>
             </div>
 
+            {/* Passcode Lock Settings */}
+            <div className="space-y-2 pt-2 border-t border-slate-100 dark:border-slate-800">
+              <span className="text-[11px] font-bold text-slate-400 uppercase tracking-wider block">
+                Privacy & Passcode Lock
+              </span>
+
+              {passcode ? (
+                <div className="space-y-2">
+                  <div className="flex items-center justify-between text-xs font-bold p-2.5 rounded-xl bg-teal-500/10 border border-teal-500/20 text-teal-600 dark:text-teal-400">
+                    <span className="flex items-center gap-1.5">
+                      <Lock size={14} />
+                      <span>PIN Lock Active</span>
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => setIsLocked(true)}
+                      className="text-[11px] underline font-bold"
+                    >
+                      Lock Now
+                    </button>
+                  </div>
+                  <div className="grid grid-cols-2 gap-2">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setNewPinInput('');
+                        setIsSettingPinModalOpen(true);
+                      }}
+                      className="py-2 px-3 rounded-xl font-bold text-xs border border-slate-200 dark:border-slate-700 hover:bg-slate-50 dark:hover:bg-slate-800 transition"
+                    >
+                      Change PIN
+                    </button>
+                    <button
+                      type="button"
+                      onClick={handleRemovePin}
+                      className="py-2 px-3 rounded-xl font-bold text-xs border border-rose-200 dark:border-rose-900/50 text-rose-500 hover:bg-rose-50 dark:hover:bg-rose-950/30 transition"
+                    >
+                      Disable PIN
+                    </button>
+                  </div>
+                </div>
+              ) : (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setNewPinInput('');
+                    setIsSettingPinModalOpen(true);
+                  }}
+                  className={`w-full py-2.5 px-3 rounded-2xl font-bold text-xs border flex items-center justify-center gap-2 transition active:scale-98 ${
+                    isDarkMode
+                      ? 'bg-slate-900 border-slate-700 text-teal-300 hover:bg-slate-800'
+                      : 'bg-teal-50 border-teal-200/80 text-teal-700 hover:bg-teal-100'
+                  }`}
+                >
+                  <Lock size={14} />
+                  <span>Set 4-Digit Passcode Lock</span>
+                </button>
+              )}
+            </div>
+
             {/* Reset Option */}
             <div className="pt-2 border-t border-slate-100 dark:border-slate-800">
               <button
@@ -2042,6 +2586,76 @@ export function App() {
                 <span>Reset Everything to $0</span>
               </button>
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* ============================================================ */}
+      {/* PIN SETUP MODAL */}
+      {/* ============================================================ */}
+      {isSettingPinModalOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/75 backdrop-blur-sm animate-in fade-in duration-150">
+          <div
+            className={`w-full max-w-xs rounded-[28px] p-6 border shadow-2xl space-y-4 ${
+              isDarkMode ? 'bg-[#141d2e] border-slate-800 text-slate-100' : 'bg-white border-slate-200 text-slate-900'
+            }`}
+          >
+            <div className="flex items-center justify-between">
+              <h3 className="font-extrabold text-base flex items-center gap-2">
+                <Lock size={18} className="text-[#0d9488]" />
+                <span>{passcode ? 'Change PIN' : 'Set 4-Digit PIN'}</span>
+              </h3>
+              <button
+                onClick={() => setIsSettingPinModalOpen(false)}
+                className="p-1 rounded-xl hover:bg-slate-100 dark:hover:bg-slate-800 text-slate-400"
+              >
+                <X size={18} />
+              </button>
+            </div>
+
+            <p className="text-xs text-slate-400">
+              Choose a 4-digit code to keep your financial logs private when opening the app.
+            </p>
+
+            <form onSubmit={handleSaveNewPin} className="space-y-4">
+              <div>
+                <label className="text-[11px] font-bold text-slate-400 uppercase tracking-wider block mb-1">
+                  4-Digit Code
+                </label>
+                <input
+                  type="password"
+                  inputMode="numeric"
+                  maxLength={4}
+                  autoFocus
+                  required
+                  placeholder="••••"
+                  value={newPinInput}
+                  onChange={(e) => setNewPinInput(e.target.value.replace(/\D/g, '').slice(0, 4))}
+                  className={`w-full tracking-widest text-center text-3xl font-black py-2.5 rounded-2xl border focus:outline-none ${
+                    isDarkMode
+                      ? 'bg-[#0b0f19] border-slate-800 text-white'
+                      : 'bg-slate-50 border-slate-200 text-slate-900'
+                  }`}
+                />
+              </div>
+
+              <div className="flex gap-2">
+                <button
+                  type="submit"
+                  disabled={newPinInput.length !== 4}
+                  className="flex-1 py-2.5 rounded-2xl font-bold text-xs bg-[#0d9488] hover:bg-[#0f766e] text-white transition shadow-sm disabled:opacity-40"
+                >
+                  Save Passcode
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setIsSettingPinModalOpen(false)}
+                  className="px-4 py-2.5 rounded-2xl font-bold text-xs bg-slate-200 dark:bg-slate-800 text-slate-700 dark:text-slate-300"
+                >
+                  Cancel
+                </button>
+              </div>
+            </form>
           </div>
         </div>
       )}
